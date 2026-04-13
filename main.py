@@ -1,13 +1,17 @@
 import asyncio
 import json
+import os
 import random
 import string
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
@@ -18,6 +22,148 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------- Database --------
+
+# Set this as an environment variable on Render:
+# DATABASE_URL=postgresql://user:pass@ep-something.neon.tech/dbname
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+db_pool = None
+
+
+async def init_db():
+    """Create the connection pool and ensure tables exist."""
+    global db_pool
+    if not DATABASE_URL:
+        print("WARNING: DATABASE_URL not set — game logging disabled")
+        return
+
+    try:
+        import asyncpg
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS games (
+                    game_id         UUID PRIMARY KEY,
+                    mode            VARCHAR(12) NOT NULL,
+                    difficulty      VARCHAR(10),
+                    first_mover_mark CHAR(1) NOT NULL,
+                    winner_mark     CHAR(1),
+                    outcome         VARCHAR(12) NOT NULL,
+                    total_turns     INT NOT NULL,
+                    started_at      TIMESTAMPTZ,
+                    ended_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    duration_seconds INT
+                );
+
+                CREATE TABLE IF NOT EXISTS turns (
+                    turn_id     SERIAL PRIMARY KEY,
+                    game_id     UUID NOT NULL REFERENCES games(game_id),
+                    turn_number INT NOT NULL,
+                    mover_mark  CHAR(1) NOT NULL,
+                    move_cell   INT NOT NULL,
+                    bomb_cell   INT NOT NULL,
+                    result      VARCHAR(10) NOT NULL
+                );
+            """)
+        print("Database connected and tables ready")
+    except Exception as e:
+        print(f"Database init failed: {e} — game logging disabled")
+        db_pool = None
+
+
+async def log_game(
+    mode: str,
+    difficulty: Optional[str],
+    first_mover_mark: str,
+    winner_mark: Optional[str],
+    outcome: str,
+    total_turns: int,
+    started_at: Optional[datetime],
+    history: list,
+):
+    """Log a completed game and its turns to the database."""
+    if db_pool is None:
+        return
+
+    game_id = uuid.uuid4()
+    ended_at = datetime.now(timezone.utc)
+    duration = None
+    if started_at:
+        duration = int((ended_at - started_at).total_seconds())
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO games (game_id, mode, difficulty, first_mover_mark,
+                                   winner_mark, outcome, total_turns,
+                                   started_at, ended_at, duration_seconds)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """, game_id, mode, difficulty, first_mover_mark,
+                winner_mark, outcome, total_turns,
+                started_at, ended_at, duration)
+
+            for turn in history:
+                await conn.execute("""
+                    INSERT INTO turns (game_id, turn_number, mover_mark,
+                                      move_cell, bomb_cell, result)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, game_id, turn["turn"], turn["player"],
+                    turn["move"], turn["bomb"], turn["result"])
+    except Exception as e:
+        print(f"Failed to log game: {e}")
+
+
+async def log_disconnect(
+    first_mover_mark: str,
+    total_turns: int,
+    started_at: Optional[datetime],
+    history: list,
+):
+    """Log a disconnected multiplayer game for diagnostic purposes."""
+    if db_pool is None:
+        return
+
+    game_id = uuid.uuid4()
+    ended_at = datetime.now(timezone.utc)
+    duration = None
+    if started_at:
+        duration = int((ended_at - started_at).total_seconds())
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO games (game_id, mode, difficulty, first_mover_mark,
+                                   winner_mark, outcome, total_turns,
+                                   started_at, ended_at, duration_seconds)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """, game_id, "multiplayer", None, first_mover_mark,
+                None, "disconnect", total_turns,
+                started_at, ended_at, duration)
+
+            for turn in history:
+                await conn.execute("""
+                    INSERT INTO turns (game_id, turn_number, mover_mark,
+                                      move_cell, bomb_cell, result)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, game_id, turn["turn"], turn["player"],
+                    turn["move"], turn["bomb"], turn["result"])
+    except Exception as e:
+        print(f"Failed to log disconnect: {e}")
+
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if db_pool:
+        await db_pool.close()
+
 
 # -------- Game Logic --------
 
@@ -43,7 +189,7 @@ def is_board_full(board: list) -> bool:
 
 class Phase(str, Enum):
     WAITING = "waiting"
-    PLAYING = "playing"       # Both players act simultaneously
+    PLAYING = "playing"
     GAME_OVER = "game_over"
 
 
@@ -58,11 +204,10 @@ class Player:
 class GameRoom:
     code: str
     board: list = field(default_factory=lambda: [None] * 9)
-    players: dict = field(default_factory=dict)  # player_id -> Player
+    players: dict = field(default_factory=dict)
     phase: Phase = Phase.WAITING
-    mover_id: Optional[str] = None     # Who places a mark this turn
-    bomber_id: Optional[str] = None    # Who places a bomb this turn
-    # Pending actions for the current turn (synchronous resolution)
+    mover_id: Optional[str] = None
+    bomber_id: Optional[str] = None
     pending_bomb: Optional[int] = None
     pending_move: Optional[int] = None
     bomber_ready: bool = False
@@ -70,7 +215,10 @@ class GameRoom:
     turn_number: int = 1
     history: list = field(default_factory=list)
     scores: dict = field(default_factory=lambda: {"X": 0, "O": 0})
-    resolving: bool = False  # Prevent double-resolution
+    resolving: bool = False
+    # Tracking fields for logging
+    first_mover_mark: str = "X"
+    started_at: Optional[datetime] = None
 
 
 # -------- Room Management --------
@@ -122,10 +270,13 @@ async def start_turn(room: GameRoom):
     room.mover_ready = False
     room.resolving = False
 
+    # Record start time on first turn
+    if room.turn_number == 1 and room.started_at is None:
+        room.started_at = datetime.now(timezone.utc)
+
     bomber = room.players[room.bomber_id]
     mover = room.players[room.mover_id]
 
-    # Tell the bomber to place a bomb
     await send_to_player(bomber, {
         "type": "your_action",
         "role": "bomber",
@@ -133,7 +284,6 @@ async def start_turn(room: GameRoom):
         **get_public_state(room),
     })
 
-    # Tell the mover to place their mark
     await send_to_player(mover, {
         "type": "your_action",
         "role": "mover",
@@ -157,7 +307,6 @@ async def try_resolve(room: GameRoom):
     mover = room.players[room.mover_id]
     bomber = room.players[room.bomber_id]
 
-    # Place the mark on the board
     room.board[move_cell] = mover.mark
 
     # Did they hit the bomb?
@@ -171,6 +320,18 @@ async def try_resolve(room: GameRoom):
             "result": "BOOM",
         })
         room.phase = Phase.GAME_OVER
+
+        # Log to database
+        await log_game(
+            mode="multiplayer",
+            difficulty=None,
+            first_mover_mark=room.first_mover_mark,
+            winner_mark=bomber.mark,
+            outcome="bomb",
+            total_turns=room.turn_number,
+            started_at=room.started_at,
+            history=room.history,
+        )
 
         await broadcast(room, {
             "type": "turn_result",
@@ -196,6 +357,18 @@ async def try_resolve(room: GameRoom):
         })
         room.phase = Phase.GAME_OVER
 
+        # Log to database
+        await log_game(
+            mode="multiplayer",
+            difficulty=None,
+            first_mover_mark=room.first_mover_mark,
+            winner_mark=win_result["winner"],
+            outcome="win",
+            total_turns=room.turn_number,
+            started_at=room.started_at,
+            history=room.history,
+        )
+
         await broadcast(room, {
             "type": "turn_result",
             "outcome": "win",
@@ -217,6 +390,18 @@ async def try_resolve(room: GameRoom):
             "result": "DRAW",
         })
         room.phase = Phase.GAME_OVER
+
+        # Log to database
+        await log_game(
+            mode="multiplayer",
+            difficulty=None,
+            first_mover_mark=room.first_mover_mark,
+            winner_mark=None,
+            outcome="draw",
+            total_turns=room.turn_number,
+            started_at=room.started_at,
+            history=room.history,
+        )
 
         await broadcast(room, {
             "type": "turn_result",
@@ -245,11 +430,9 @@ async def try_resolve(room: GameRoom):
         **get_public_state(room),
     })
 
-    # Swap roles
     room.mover_id, room.bomber_id = room.bomber_id, room.mover_id
     room.turn_number += 1
 
-    # Brief pause for clients to show the result, then start next turn
     await asyncio.sleep(2.0)
     await start_turn(room)
 
@@ -265,9 +448,12 @@ async def reset_room(room: GameRoom):
     room.resolving = False
     room.turn_number = 1
     room.history = []
+    room.started_at = None
 
     # Swap who goes first each game
     room.mover_id, room.bomber_id = room.bomber_id, room.mover_id
+    # Track the new first mover
+    room.first_mover_mark = room.players[room.mover_id].mark
 
     await broadcast(room, {
         "type": "new_game",
@@ -277,6 +463,81 @@ async def reset_room(room: GameRoom):
 
     await asyncio.sleep(0.5)
     await start_turn(room)
+
+
+# -------- REST Endpoint for AI Game Logging --------
+
+@app.post("/log-game")
+async def log_ai_game(request: Request):
+    """Receive completed AI game data from the frontend."""
+    try:
+        data = await request.json()
+
+        # Validate required fields
+        required = ["mode", "first_mover_mark", "outcome", "total_turns", "history"]
+        for field_name in required:
+            if field_name not in data:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Missing field: {field_name}"},
+                )
+
+        started_at = None
+        if data.get("started_at"):
+            try:
+                started_at = datetime.fromisoformat(data["started_at"].replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+
+        await log_game(
+            mode=data["mode"],
+            difficulty=data.get("difficulty"),
+            first_mover_mark=data["first_mover_mark"],
+            winner_mark=data.get("winner_mark"),
+            outcome=data["outcome"],
+            total_turns=data["total_turns"],
+            started_at=started_at,
+            history=data["history"],
+        )
+
+        return {"status": "logged"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# -------- Stats Endpoint --------
+
+@app.get("/stats")
+async def get_stats():
+    """Return aggregate game stats."""
+    if db_pool is None:
+        return {"error": "Database not connected"}
+
+    try:
+        async with db_pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM games WHERE outcome != 'disconnect'")
+            by_outcome = await conn.fetch(
+                "SELECT outcome, COUNT(*) as count FROM games WHERE outcome != 'disconnect' GROUP BY outcome"
+            )
+            by_mode = await conn.fetch(
+                "SELECT mode, COUNT(*) as count FROM games WHERE outcome != 'disconnect' GROUP BY mode"
+            )
+            avg_turns = await conn.fetchval(
+                "SELECT ROUND(AVG(total_turns)::numeric, 1) FROM games WHERE outcome != 'disconnect'"
+            )
+            first_mover_wins = await conn.fetchval(
+                "SELECT COUNT(*) FROM games WHERE winner_mark = first_mover_mark AND outcome != 'disconnect'"
+            )
+
+        return {
+            "total_games": total,
+            "by_outcome": {r["outcome"]: r["count"] for r in by_outcome},
+            "by_mode": {r["mode"]: r["count"] for r in by_mode},
+            "avg_turns": float(avg_turns) if avg_turns else None,
+            "first_mover_win_rate": round(first_mover_wins / total * 100, 1) if total > 0 else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # -------- WebSocket Endpoint --------
@@ -318,6 +579,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
         player_ids = list(room.players.keys())
         room.mover_id = player_ids[0]
         room.bomber_id = player_ids[1]
+        room.first_mover_mark = "X"
 
         await send_to_player(player, {
             "type": "room_joined",
@@ -359,7 +621,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                     })
                     continue
                 if room.bomber_ready:
-                    continue  # Already submitted
+                    continue
 
                 cell = data.get("cell")
                 if not isinstance(cell, int) or cell < 0 or cell > 8:
@@ -389,7 +651,7 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
                     })
                     continue
                 if room.mover_ready:
-                    continue  # Already submitted
+                    continue
 
                 cell = data.get("cell")
                 if not isinstance(cell, int) or cell < 0 or cell > 8:
@@ -423,9 +685,25 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
             del room.players[player_id]
 
         if len(room.players) == 0:
+            # Log disconnect if game was in progress
+            if room.started_at and room.history:
+                await log_disconnect(
+                    first_mover_mark=room.first_mover_mark,
+                    total_turns=room.turn_number,
+                    started_at=room.started_at,
+                    history=room.history,
+                )
             if actual_code in rooms:
                 del rooms[actual_code]
         else:
+            # Log disconnect if game was in progress
+            if room.started_at and room.history:
+                await log_disconnect(
+                    first_mover_mark=room.first_mover_mark,
+                    total_turns=room.turn_number,
+                    started_at=room.started_at,
+                    history=room.history,
+                )
             for p in room.players.values():
                 await send_to_player(p, {
                     "type": "opponent_disconnected",
@@ -436,4 +714,4 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "rooms": len(rooms)}
+    return {"status": "ok", "rooms": len(rooms), "db": "connected" if db_pool else "disabled"}
